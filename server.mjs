@@ -86,7 +86,6 @@ function addEvent(type, username, message, details = {}, eventId) {
     follow: "➕",
     like: "❤️",
     share: "🔁",
-    join: "👋",
     chat: "💬"
   };
 
@@ -249,14 +248,6 @@ if (!USERNAME) {
       "share",
       getUser(data),
       "shared the LIVE 🔁"
-    );
-  });
-
-  connection.on(WebcastEvent.MEMBER, (data) => {
-    addEvent(
-      "join",
-      getUser(data),
-      "joined the LIVE 👋"
     );
   });
 
