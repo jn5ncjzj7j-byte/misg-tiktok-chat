@@ -8,8 +8,8 @@ const ENABLE_LIKE_EVENTS =
   (process.env.ENABLE_LIKE_EVENTS || "false").toLowerCase() === "true";
 
 const MAX_COMMENTS = 10;
-const MAX_EVENTS = 100;
-const MAX_SEEN_IDS = 500;
+const MAX_EVENTS = 10;
+const MAX_SEEN_IDS = 50;
 
 const comments = [];
 const events = [];
