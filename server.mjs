@@ -3,10 +3,13 @@ import { createServer } from "node:http";
 import { TikTokLiveConnection, WebcastEvent } from "tiktok-live-connector";
 
 const PORT = Number(process.env.PORT || 3000);
-const USERNAME = (process.env.TIKTOK_USERNAME || "").replace(/^@/, "");
+const USERNAME = (process.env.TIKTOK_USERNAME || "").trim().replace(/^@/, "");
+const ENABLE_LIKE_EVENTS =
+  (process.env.ENABLE_LIKE_EVENTS || "false").toLowerCase() === "true";
 
 const MAX_COMMENTS = 10;
 const MAX_EVENTS = 100;
+const MAX_SEEN_IDS = 500;
 
 const comments = [];
 const events = [];
@@ -19,7 +22,7 @@ let viewerUpdatedAt = null;
 let viewerStatus = "unavailable";
 
 function addComment(user, message, id) {
-  if (typeof message !== "string" || !message.trim()) return;
+  if (typeof message !== "string" || !message.trim()) return null;
 
   const comment = {
     id: String(id || `${Date.now()}-${Math.random()}`),
@@ -39,7 +42,7 @@ function addComment(user, message, id) {
 function getUser(data) {
   const user = data?.user || data?.author || {};
 
-  return (
+  return String(
     user.nickname ||
     user.displayName ||
     user.uniqueId ||
@@ -47,23 +50,28 @@ function getUser(data) {
     data?.nickname ||
     data?.uniqueId ||
     "Viewer"
-  );
+  ).slice(0, 40);
 }
 
-function addEvent(type, username, message, details = {}, eventId) {
-  const id = String(
-    eventId || `${type}-${Date.now()}-${Math.random()}`
-  );
-
-  if (seenEventIds.has(id)) return;
+function rememberEventId(id) {
+  if (seenEventIds.has(id)) return false;
 
   seenEventIds.add(id);
 
-  // Keep the deduplication set bounded.
-  if (seenEventIds.size > 500) {
+  if (seenEventIds.size > MAX_SEEN_IDS) {
     const oldest = seenEventIds.values().next().value;
     seenEventIds.delete(oldest);
   }
+
+  return true;
+}
+
+function addEvent(type, username, message, details = {}, externalId) {
+  const dedupeId = String(
+    externalId || `${type}-${Date.now()}-${Math.random()}`
+  );
+
+  if (!rememberEventId(dedupeId)) return null;
 
   const event = {
     id: ++nextEventId,
@@ -80,7 +88,6 @@ function addEvent(type, username, message, details = {}, eventId) {
     events.shift();
   }
 
-  // Convert the event into a normal comments-feed entry.
   const icons = {
     gift: "🎁",
     follow: "➕",
@@ -89,19 +96,22 @@ function addEvent(type, username, message, details = {}, eventId) {
     chat: "💬"
   };
 
+  // Each event creates exactly one comments-feed entry.
   addComment(
     `${icons[type] || "📣"} ${event.username}`,
     event.message,
-    `event-${id}`
+    `event-${event.id}`
   );
 
-  console.log(`[LIVE EVENT] ${type}: ${event.username} — ${event.message}`);
+  console.log(
+    `[LIVE EVENT] ${type}: ${event.username} — ${event.message}`
+  );
 
   return event;
 }
 
 function getViewerCount(data) {
-  const possibleValues = [
+  const values = [
     data?.viewerCount,
     data?.viewer_count,
     data?.userCount,
@@ -109,10 +119,12 @@ function getViewerCount(data) {
     data?.total
   ];
 
-  for (const value of possibleValues) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+
     const number = Number(value);
 
-    if (value !== undefined && value !== null && Number.isFinite(number)) {
+    if (Number.isSafeInteger(number) && number >= 0) {
       return number;
     }
   }
@@ -122,18 +134,20 @@ function getViewerCount(data) {
 
 function getGiftDetails(data) {
   const gift = data?.giftDetails || data?.gift || {};
+
   const giftName =
     gift.giftName ||
     gift.name ||
     data?.giftName ||
-    (data?.giftId ? `Gift ${data.giftId}` : "a gift");
+    (data?.giftId != null ? `Gift ${data.giftId}` : "a gift");
 
-  const quantity = Math.max(
-    1,
-    Number(data?.repeatCount || data?.quantity || 1)
-  );
+  const rawQuantity = Number(data?.repeatCount ?? data?.quantity ?? 1);
+  const quantity =
+    Number.isSafeInteger(rawQuantity) && rawQuantity > 0
+      ? Math.min(rawQuantity, 1000000)
+      : 1;
 
-  const coinValue = Number(
+  const rawCoins = Number(
     gift.diamondCount ??
     gift.coins ??
     data?.diamondCount ??
@@ -141,10 +155,15 @@ function getGiftDetails(data) {
     0
   );
 
+  const coins =
+    Number.isFinite(rawCoins) && rawCoins >= 0
+      ? Math.min(rawCoins * quantity, Number.MAX_SAFE_INTEGER)
+      : 0;
+
   return {
     giftName: String(giftName).slice(0, 80),
     quantity,
-    coins: Number.isFinite(coinValue) ? coinValue * quantity : 0
+    coins
   };
 }
 
@@ -169,97 +188,141 @@ function registerDemoData() {
   );
 }
 
+function safeHandleEvent(name, handler) {
+  return (data) => {
+    try {
+      handler(data);
+    } catch (error) {
+      console.error(
+        `Failed to process TikTok ${name} event:`,
+        error?.message || error
+      );
+    }
+  };
+}
+
+let connection = null;
+
 if (!USERNAME) {
   status = "demo";
   registerDemoData();
+  console.log("No TIKTOK_USERNAME configured; using demo data.");
 } else {
-  const connection = new TikTokLiveConnection(USERNAME, {});
+  connection = new TikTokLiveConnection(USERNAME, {});
 
   connection.on("connected", () => {
     status = "connected";
     console.log(`Connected to TikTok LIVE: @${USERNAME}`);
   });
 
-  connection.on(WebcastEvent.CHAT, (data) => {
-    const username = getUser(data);
-    const message = data?.comment || data?.text || "";
+  connection.on(
+    WebcastEvent.CHAT,
+    safeHandleEvent("CHAT", (data) => {
+      const username = getUser(data);
+      const message = data?.comment ?? data?.text ?? "";
 
-    if (!message.trim()) return;
+      if (typeof message !== "string" || !message.trim()) return;
 
-    const id = String(
-      data?.msgId ||
-      data?.messageId ||
-      `chat-${Date.now()}-${Math.random()}`
+      const messageId =
+        data?.msgId ??
+        data?.messageId ??
+        `chat-${Date.now()}-${Math.random()}`;
+
+      // Do not call addComment separately: addEvent adds it to the feed.
+      addEvent(
+        "chat",
+        username,
+        message,
+        {},
+        `chat-${messageId}`
+      );
+    })
+  );
+
+  connection.on(
+    WebcastEvent.GIFT,
+    safeHandleEvent("GIFT", (data) => {
+      const giftType = Number(
+        data?.giftType ?? data?.gift?.giftType ?? 0
+      );
+
+      // Wait for the final update of a gift streak.
+      if (giftType === 1 && data?.repeatEnd === false) return;
+
+      const username = getUser(data);
+      const { giftName, quantity, coins } = getGiftDetails(data);
+
+      addEvent(
+        "gift",
+        username,
+        `sent ${giftName} ×${quantity} (${coins} coins)`,
+        { giftName, quantity, coins },
+        data?.msgId != null ? `gift-${data.msgId}` : undefined
+      );
+    })
+  );
+
+  connection.on(
+    WebcastEvent.FOLLOW,
+    safeHandleEvent("FOLLOW", (data) => {
+      addEvent(
+        "follow",
+        getUser(data),
+        "followed the LIVE! 👋",
+        {},
+        data?.msgId != null ? `follow-${data.msgId}` : undefined
+      );
+    })
+  );
+
+  if (ENABLE_LIKE_EVENTS) {
+    connection.on(
+      WebcastEvent.LIKE,
+      safeHandleEvent("LIKE", (data) => {
+        const rawCount = Number(data?.likeCount ?? data?.count ?? 1);
+        const count =
+          Number.isSafeInteger(rawCount) && rawCount > 0
+            ? rawCount
+            : 1;
+
+        addEvent(
+          "like",
+          getUser(data),
+          `liked the LIVE ❤️${count > 1 ? ` ×${count}` : ""}`,
+          {},
+          data?.msgId != null ? `like-${data.msgId}` : undefined
+        );
+      })
     );
+  }
 
-    addComment(username, message, id);
+  connection.on(
+    WebcastEvent.SHARE,
+    safeHandleEvent("SHARE", (data) => {
+      addEvent(
+        "share",
+        getUser(data),
+        "shared the LIVE 🔁",
+        {},
+        data?.msgId != null ? `share-${data.msgId}` : undefined
+      );
+    })
+  );
 
-    addEvent(
-      "chat",
-      username,
-      message,
-      {},
-      `chat-event-${id}`
-    );
-  });
+  // Viewer joins intentionally are not registered.
+  // Viewer count is tracked separately from feed events.
+  connection.on(
+    WebcastEvent.ROOM_USER,
+    safeHandleEvent("ROOM_USER", (data) => {
+      const count = getViewerCount(data);
 
-  connection.on(WebcastEvent.GIFT, (data) => {
-    // Avoid displaying incomplete gift streak updates.
-    const giftType = Number(data?.giftType ?? data?.gift?.giftType ?? 0);
-    const repeatEnd = data?.repeatEnd;
-
-    if (giftType === 1 && repeatEnd === false) return;
-
-    const username = getUser(data);
-    const { giftName, quantity, coins } = getGiftDetails(data);
-
-    const message =
-      `sent ${giftName} ×${quantity} (${coins} coins)`;
-
-    addEvent(
-      "gift",
-      username,
-      message,
-      { giftName, quantity, coins },
-      data?.msgId ? `gift-${data.msgId}` : undefined
-    );
-  });
-
-  connection.on(WebcastEvent.FOLLOW, (data) => {
-    addEvent(
-      "follow",
-      getUser(data),
-      "followed the LIVE! 👋"
-    );
-  });
-
-  connection.on(WebcastEvent.LIKE, (data) => {
-    const count = Number(data?.likeCount || data?.count || 1);
-
-    addEvent(
-      "like",
-      getUser(data),
-      `liked the LIVE ❤️${count > 1 ? ` ×${count}` : ""}`
-    );
-  });
-
-  connection.on(WebcastEvent.SHARE, (data) => {
-    addEvent(
-      "share",
-      getUser(data),
-      "shared the LIVE 🔁"
-    );
-  });
-
-  connection.on(WebcastEvent.ROOM_USER, (data) => {
-    const count = getViewerCount(data);
-
-    if (count !== null) {
-      viewerCount = count;
-      viewerUpdatedAt = new Date().toISOString();
-      viewerStatus = "available";
-    }
-  });
+      if (count !== null) {
+        viewerCount = count;
+        viewerUpdatedAt = new Date().toISOString();
+        viewerStatus = "available";
+      }
+    })
+  );
 
   connection.on("disconnected", () => {
     status = "disconnected";
@@ -271,16 +334,22 @@ if (!USERNAME) {
 
   connection.on("error", (error) => {
     status = "error";
-    console.error("TikTok LIVE connection error:", error?.message || error);
+    console.error(
+      "TikTok LIVE connection error:",
+      error?.message || error
+    );
   });
 
   connection.connect().catch((error) => {
     status = "error";
-    console.error("TikTok LIVE connection failed:", error?.message || error);
+    console.error(
+      "TikTok LIVE connection failed:",
+      error?.message || error
+    );
   });
 }
 
-createServer((req, res) => {
+const server = createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -292,14 +361,26 @@ createServer((req, res) => {
     return res.end();
   }
 
-  const url = new URL(
-    req.url || "/",
-    `http://${req.headers.host || "localhost"}`
-  );
+  let url;
+
+  try {
+    url = new URL(
+      req.url || "/",
+      `http://${req.headers.host || "localhost"}`
+    );
+  } catch {
+    res.writeHead(400);
+    return res.end(JSON.stringify({ error: "Invalid URL" }));
+  }
 
   const path = url.pathname;
 
-  if (req.method === "GET" && path === "/") {
+  if (req.method !== "GET") {
+    res.writeHead(405, { Allow: "GET, OPTIONS" });
+    return res.end(JSON.stringify({ error: "Method not allowed" }));
+  }
+
+  if (path === "/") {
     return res.end(JSON.stringify({
       ok: true,
       service: "misg TikTok LIVE bridge",
@@ -308,15 +389,15 @@ createServer((req, res) => {
     }));
   }
 
-  if (req.method === "GET" && path === "/health") {
+  if (path === "/health") {
     return res.end(JSON.stringify({ ok: true, status }));
   }
 
-  if (req.method === "GET" && path === "/comments") {
+  if (path === "/comments") {
     return res.end(JSON.stringify({ status, comments }));
   }
 
-  if (req.method === "GET" && path === "/viewers") {
+  if (path === "/viewers") {
     return res.end(JSON.stringify({
       status,
       isLive: status === "connected",
@@ -326,8 +407,12 @@ createServer((req, res) => {
     }));
   }
 
-  if (req.method === "GET" && path === "/events") {
-    const after = Math.max(0, Number(url.searchParams.get("after") || 0));
+  if (path === "/events") {
+    const rawAfter = Number(url.searchParams.get("after") || 0);
+    const after =
+      Number.isSafeInteger(rawAfter) && rawAfter > 0
+        ? rawAfter
+        : 0;
 
     return res.end(JSON.stringify({
       status,
@@ -339,7 +424,24 @@ createServer((req, res) => {
 
   res.writeHead(404);
   return res.end(JSON.stringify({ error: "Not found" }));
-}).listen(PORT, "0.0.0.0", () => {
+});
+
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`misg TikTok LIVE bridge listening on port ${PORT}`);
   console.log(`TikTok account: ${USERNAME ? `@${USERNAME}` : "DEMO MODE"}`);
+  console.log(`Like events: ${ENABLE_LIKE_EVENTS ? "enabled" : "disabled"}`);
 });
+
+function shutdown(signal) {
+  console.log(`${signal} received; shutting down server`);
+
+  server.close(() => {
+    process.exit(0);
+  });
+
+  // Allow the process to terminate even if an HTTP connection hangs.
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
