@@ -39,15 +39,39 @@ if (!USERNAME) {
     msgId: data.msgId
   }));
 
-  addComment(
-    data.user?.uniqueId || data.user?.nickname,
-    data.comment,
-    data.msgId
-  );
+  
+connection.on(WebcastEvent.CHAT, data => {
+  console.log("FULL CHAT EVENT:", JSON.stringify(data));
+
+  const user =
+    data.user?.uniqueId ||
+    data.user?.nickname ||
+    data.nickname ||
+    data.uniqueId ||
+    "Viewer";
+
+  const message =
+    data.comment ??
+    data.text ??
+    data.content ??
+    data.message ??
+    data.chatMessage ??
+    data.data?.comment ??
+    data.data?.text;
+
+  const id =
+    data.msgId ??
+    data.messageId ??
+    data.id ??
+    data.common?.msgId;
+
+  if (typeof message === "string" && message.trim()) {
+    addComment(user, message, id);
+    console.log("COMMENT SAVED:", user, message);
+  } else {
+    console.log("MESSAGE FIELD NOT FOUND");
+  }
 });
-  connection.on("disconnected", () => {
-    status = "disconnected";
-  });
 
   connection.on("error", error => {
     status = "error";
