@@ -1,4 +1,3 @@
-
 import { createServer } from "node:http";
 import { TikTokLiveConnection, WebcastEvent } from "tiktok-live-connector";
 
@@ -53,25 +52,19 @@ function getUser(data) {
   ).slice(0, 40);
 }
 
-function rememberEventId(id) {
-  if (seenEventIds.has(id)) return false;
-
-  seenEventIds.add(id);
-
-  if (seenEventIds.size > MAX_SEEN_IDS) {
-    const oldest = seenEventIds.values().next().value;
-    seenEventIds.delete(oldest);
-  }
-
-  return true;
-}
-
 function addEvent(type, username, message, details = {}, externalId) {
   const dedupeId = String(
     externalId || `${type}-${Date.now()}-${Math.random()}`
   );
 
-  if (!rememberEventId(dedupeId)) return null;
+  if (seenEventIds.has(dedupeId)) return null;
+
+  seenEventIds.add(dedupeId);
+
+  while (seenEventIds.size > MAX_SEEN_IDS) {
+    const oldestId = seenEventIds.values().next().value;
+    seenEventIds.delete(oldestId);
+  }
 
   const event = {
     id: ++nextEventId,
@@ -96,16 +89,14 @@ function addEvent(type, username, message, details = {}, externalId) {
     chat: "💬"
   };
 
-  // Each event creates exactly one comments-feed entry.
+  // Each event is added to the comments feed exactly once.
   addComment(
     `${icons[type] || "📣"} ${event.username}`,
     event.message,
     `event-${event.id}`
   );
 
-  console.log(
-    `[LIVE EVENT] ${type}: ${event.username} — ${event.message}`
-  );
+  console.log(`[LIVE EVENT] ${type}: ${event.username} — ${event.message}`);
 
   return event;
 }
@@ -122,10 +113,10 @@ function getViewerCount(data) {
   for (const value of values) {
     if (value === undefined || value === null || value === "") continue;
 
-    const number = Number(value);
+    const count = Number(value);
 
-    if (Number.isSafeInteger(number) && number >= 0) {
-      return number;
+    if (Number.isSafeInteger(count) && count >= 0) {
+      return count;
     }
   }
 
@@ -194,21 +185,19 @@ function safeHandleEvent(name, handler) {
       handler(data);
     } catch (error) {
       console.error(
-        `Failed to process TikTok ${name} event:`,
+        `Failed to process ${name}:`,
         error?.message || error
       );
     }
   };
 }
 
-let connection = null;
-
 if (!USERNAME) {
   status = "demo";
   registerDemoData();
-  console.log("No TIKTOK_USERNAME configured; using demo data.");
+  console.log("TIKTOK_USERNAME is missing; using demo data.");
 } else {
-  connection = new TikTokLiveConnection(USERNAME, {});
+  const connection = new TikTokLiveConnection(USERNAME, {});
 
   connection.on("connected", () => {
     status = "connected";
@@ -228,7 +217,8 @@ if (!USERNAME) {
         data?.messageId ??
         `chat-${Date.now()}-${Math.random()}`;
 
-      // Do not call addComment separately: addEvent adds it to the feed.
+      // Do not call addComment() here.
+      // addEvent() already creates the single feed entry.
       addEvent(
         "chat",
         username,
@@ -242,20 +232,19 @@ if (!USERNAME) {
   connection.on(
     WebcastEvent.GIFT,
     safeHandleEvent("GIFT", (data) => {
-      const giftType = Number(
-        data?.giftType ?? data?.gift?.giftType ?? 0
-      );
+      const giftType = Number(data?.giftType ?? data?.gift?.giftType ?? 0);
 
-      // Wait for the final update of a gift streak.
+      // Ignore incomplete gift streak updates.
       if (giftType === 1 && data?.repeatEnd === false) return;
 
       const username = getUser(data);
       const { giftName, quantity, coins } = getGiftDetails(data);
+      const message = `sent ${giftName} ×${quantity} (${coins} coins)`;
 
       addEvent(
         "gift",
         username,
-        `sent ${giftName} ×${quantity} (${coins} coins)`,
+        message,
         { giftName, quantity, coins },
         data?.msgId != null ? `gift-${data.msgId}` : undefined
       );
@@ -275,6 +264,7 @@ if (!USERNAME) {
     })
   );
 
+  // Likes are disabled unless ENABLE_LIKE_EVENTS=true.
   if (ENABLE_LIKE_EVENTS) {
     connection.on(
       WebcastEvent.LIKE,
@@ -309,8 +299,8 @@ if (!USERNAME) {
     })
   );
 
-  // Viewer joins intentionally are not registered.
-  // Viewer count is tracked separately from feed events.
+  // Intentionally no MEMBER/join event handler.
+  // Viewer count is tracked separately from the feed.
   connection.on(
     WebcastEvent.ROOM_USER,
     safeHandleEvent("ROOM_USER", (data) => {
@@ -334,18 +324,12 @@ if (!USERNAME) {
 
   connection.on("error", (error) => {
     status = "error";
-    console.error(
-      "TikTok LIVE connection error:",
-      error?.message || error
-    );
+    console.error("TikTok LIVE connection error:", error?.message || error);
   });
 
   connection.connect().catch((error) => {
     status = "error";
-    console.error(
-      "TikTok LIVE connection failed:",
-      error?.message || error
-    );
+    console.error("TikTok LIVE connection failed:", error?.message || error);
   });
 }
 
@@ -373,12 +357,12 @@ const server = createServer((req, res) => {
     return res.end(JSON.stringify({ error: "Invalid URL" }));
   }
 
-  const path = url.pathname;
-
   if (req.method !== "GET") {
     res.writeHead(405, { Allow: "GET, OPTIONS" });
     return res.end(JSON.stringify({ error: "Method not allowed" }));
   }
+
+  const path = url.pathname;
 
   if (path === "/") {
     return res.end(JSON.stringify({
@@ -433,13 +417,12 @@ server.listen(PORT, "0.0.0.0", () => {
 });
 
 function shutdown(signal) {
-  console.log(`${signal} received; shutting down server`);
+  console.log(`${signal} received; shutting down`);
 
   server.close(() => {
     process.exit(0);
   });
 
-  // Allow the process to terminate even if an HTTP connection hangs.
   setTimeout(() => process.exit(1), 5000).unref();
 }
 
