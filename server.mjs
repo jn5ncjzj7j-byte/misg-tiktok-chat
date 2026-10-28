@@ -7,6 +7,9 @@ const comments = [];
 const MAX_COMMENTS = 10;
 
 let status = USERNAME ? "connecting" : "demo";
+let viewerCount = null;
+let viewerUpdatedAt = null;
+let viewerStatus = "unavailable";
 
 function addComment(user, message, id) {
   if (typeof message !== "string" || !message.trim()) {
@@ -24,6 +27,39 @@ function addComment(user, message, id) {
   }
 }
 
+function updateViewerCount(data) {
+  const candidates = [
+    data?.viewerCount,
+    data?.userCount,
+    data?.totalUser,
+    data?.totalUserCount,
+    data?.roomUserCount,
+    data?.data?.viewerCount,
+    data?.data?.userCount,
+    data?.data?.totalUser,
+    data?.data?.totalUserCount
+  ];
+
+  const value = candidates.find(
+    candidate =>
+      (typeof candidate === "number" ||
+        (typeof candidate === "string" && candidate.trim() !== "")) &&
+      Number.isFinite(Number(candidate)) &&
+      Number(candidate) >= 0
+  );
+
+  if (value === undefined) {
+    console.log("ROOM_USER event received without a recognized viewer count");
+    return;
+  }
+
+  viewerCount = Math.floor(Number(value));
+  viewerUpdatedAt = new Date().toISOString();
+  viewerStatus = "available";
+
+  console.log("VIEWER COUNT:", viewerCount);
+}
+
 if (!USERNAME) {
   addComment("PixelFan", "Hello from the bridge!", "demo-1");
   addComment("Mia", "Testing the Roblox chat overlay!", "demo-2");
@@ -36,8 +72,6 @@ if (!USERNAME) {
   });
 
   connection.on(WebcastEvent.CHAT, data => {
-    console.log("FULL CHAT EVENT:", JSON.stringify(data));
-
     const user =
       data.user?.uniqueId ||
       data.user?.nickname ||
@@ -63,13 +97,16 @@ if (!USERNAME) {
     if (typeof message === "string" && message.trim()) {
       addComment(user, message, id);
       console.log("COMMENT SAVED:", user, message);
-    } else {
-      console.log("MESSAGE FIELD NOT FOUND");
     }
+  });
+
+  connection.on(WebcastEvent.ROOM_USER, data => {
+    updateViewerCount(data);
   });
 
   connection.on("disconnected", () => {
     status = "disconnected";
+    viewerStatus = "unavailable";
     console.log("TikTok LIVE disconnected");
   });
 
@@ -80,14 +117,23 @@ if (!USERNAME) {
 
   connection.connect().catch(error => {
     status = "error";
+    viewerStatus = "unavailable";
     console.error("TikTok connection failed:", error);
   });
 }
 
 createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   const path = new URL(
     req.url || "/",
@@ -100,9 +146,25 @@ createServer((req, res) => {
     return;
   }
 
+  if (req.method === "GET" && path === "/viewers") {
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      status,
+      isLive: status === "connected",
+      viewerCount,
+      updatedAt: viewerUpdatedAt,
+      viewerStatus
+    }));
+    return;
+  }
+
   if (req.method === "GET" && path === "/health") {
     res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, status }));
+    res.end(JSON.stringify({
+      ok: true,
+      status,
+      viewerStatus
+    }));
     return;
   }
 
