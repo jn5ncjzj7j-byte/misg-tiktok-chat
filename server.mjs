@@ -33,13 +33,18 @@ if (!USERNAME) {
   });
 
   connection.on(WebcastEvent.CHAT, data => {
-    addComment(
-      data.user?.uniqueId || data.user?.nickname,
-      data.comment,
-      data.msgId
-    );
-  });
+  console.log("CHAT EVENT RECEIVED:", JSON.stringify({
+    user: data.user?.uniqueId || data.user?.nickname,
+    comment: data.comment,
+    msgId: data.msgId
+  }));
 
+  addComment(
+    data.user?.uniqueId || data.user?.nickname,
+    data.comment,
+    data.msgId
+  );
+});
   connection.on("disconnected", () => {
     status = "disconnected";
   });
