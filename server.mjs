@@ -4,6 +4,7 @@ import { TikTokLiveConnection, WebcastEvent } from "tiktok-live-connector";
 
 const PORT = Number(process.env.PORT || 3000);
 const USERNAME = (process.env.TIKTOK_USERNAME || "").trim().replace(/^@/, "");
+const SIGN_API_KEY = (process.env.SIGN_API_KEY || "").trim();
 const ENABLE_LIKE_EVENTS =
   (process.env.ENABLE_LIKE_EVENTS || "false").toLowerCase() === "true";
 
@@ -14,6 +15,7 @@ const MAX_SEEN_IDS = 50;
 const comments = [];
 const events = [];
 const seenEventIds = new Set();
+const seenCommentIds = new Set();
 
 let nextEventId = 0;
 let status = USERNAME ? "connecting" : "demo";
@@ -21,11 +23,27 @@ let viewerCount = null;
 let viewerUpdatedAt = null;
 let viewerStatus = "unavailable";
 
+function rememberId(set, id) {
+  if (set.has(id)) return false;
+
+  set.add(id);
+
+  while (set.size > MAX_SEEN_IDS) {
+    set.delete(set.values().next().value);
+  }
+
+  return true;
+}
+
 function addComment(user, message, id) {
   if (typeof message !== "string" || !message.trim()) return null;
 
+  const commentId = String(id || `${Date.now()}-${Math.random()}`);
+
+  if (!rememberId(seenCommentIds, commentId)) return null;
+
   const comment = {
-    id: String(id || `${Date.now()}-${Math.random()}`),
+    id: commentId,
     user: String(user || "Viewer").slice(0, 40),
     text: message.trim().slice(0, 240)
   };
@@ -35,6 +53,8 @@ function addComment(user, message, id) {
   while (comments.length > MAX_COMMENTS) {
     comments.shift();
   }
+
+  console.log(`[CHAT] ${comment.user}: ${comment.text}`);
 
   return comment;
 }
@@ -58,14 +78,7 @@ function addEvent(type, username, message, details = {}, externalId) {
     externalId || `${type}-${Date.now()}-${Math.random()}`
   );
 
-  if (seenEventIds.has(dedupeId)) return null;
-
-  seenEventIds.add(dedupeId);
-
-  while (seenEventIds.size > MAX_SEEN_IDS) {
-    const oldestId = seenEventIds.values().next().value;
-    seenEventIds.delete(oldestId);
-  }
+  if (!rememberId(seenEventIds, dedupeId)) return null;
 
   const event = {
     id: ++nextEventId,
@@ -81,21 +94,6 @@ function addEvent(type, username, message, details = {}, externalId) {
   while (events.length > MAX_EVENTS) {
     events.shift();
   }
-
-  const icons = {
-    gift: "🎁",
-    follow: "➕",
-    like: "❤️",
-    share: "🔁",
-    chat: "💬"
-  };
-
-  // Each event is added to the comments feed exactly once.
-  addComment(
-    `${icons[type] || "📣"} ${event.username}`,
-    event.message,
-    `event-${event.id}`
-  );
 
   console.log(`[LIVE EVENT] ${type}: ${event.username} — ${event.message}`);
 
@@ -185,10 +183,7 @@ function safeHandleEvent(name, handler) {
     try {
       handler(data);
     } catch (error) {
-      console.error(
-        `Failed to process ${name}:`,
-        error?.message || error
-      );
+      console.error(`Failed to process ${name}:`, error);
     }
   };
 }
@@ -198,7 +193,9 @@ if (!USERNAME) {
   registerDemoData();
   console.log("TIKTOK_USERNAME is missing; using demo data.");
 } else {
-  const connection = new TikTokLiveConnection(USERNAME, {});
+  const connection = new TikTokLiveConnection(USERNAME, {
+    signApiKey: SIGN_API_KEY || undefined
+  });
 
   connection.on("connected", () => {
     status = "connected";
@@ -211,22 +208,12 @@ if (!USERNAME) {
       const username = getUser(data);
       const message = data?.comment ?? data?.text ?? "";
 
-      if (typeof message !== "string" || !message.trim()) return;
-
       const messageId =
         data?.msgId ??
         data?.messageId ??
         `chat-${Date.now()}-${Math.random()}`;
 
-      // Do not call addComment() here.
-      // addEvent() already creates the single feed entry.
-      addEvent(
-        "chat",
-        username,
-        message,
-        {},
-        `chat-${messageId}`
-      );
+      addComment(username, message, `chat-${messageId}`);
     })
   );
 
@@ -235,7 +222,6 @@ if (!USERNAME) {
     safeHandleEvent("GIFT", (data) => {
       const giftType = Number(data?.giftType ?? data?.gift?.giftType ?? 0);
 
-      // Ignore incomplete gift streak updates.
       if (giftType === 1 && data?.repeatEnd === false) return;
 
       const username = getUser(data);
@@ -265,7 +251,6 @@ if (!USERNAME) {
     })
   );
 
-  // Likes are disabled unless ENABLE_LIKE_EVENTS=true.
   if (ENABLE_LIKE_EVENTS) {
     connection.on(
       WebcastEvent.LIKE,
@@ -280,7 +265,7 @@ if (!USERNAME) {
           "like",
           getUser(data),
           `liked the LIVE ❤️${count > 1 ? ` ×${count}` : ""}`,
-          {},
+          { count },
           data?.msgId != null ? `like-${data.msgId}` : undefined
         );
       })
@@ -300,8 +285,6 @@ if (!USERNAME) {
     })
   );
 
-  // Intentionally no MEMBER/join event handler.
-  // Viewer count is tracked separately from the feed.
   connection.on(
     WebcastEvent.ROOM_USER,
     safeHandleEvent("ROOM_USER", (data) => {
@@ -325,12 +308,12 @@ if (!USERNAME) {
 
   connection.on("error", (error) => {
     status = "error";
-    console.error("TikTok LIVE connection error:", error?.message || error);
+    console.error("TikTok LIVE connection error:", error);
   });
 
   connection.connect().catch((error) => {
     status = "error";
-    console.error("TikTok LIVE connection failed:", error?.message || error);
+    console.error("TikTok LIVE connection failed:", error);
   });
 }
 
@@ -414,6 +397,7 @@ const server = createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`misg TikTok LIVE bridge listening on port ${PORT}`);
   console.log(`TikTok account: ${USERNAME ? `@${USERNAME}` : "DEMO MODE"}`);
+  console.log(`EulerStream API key: ${SIGN_API_KEY ? "configured" : "not configured"}`);
   console.log(`Like events: ${ENABLE_LIKE_EVENTS ? "enabled" : "disabled"}`);
 });
 
