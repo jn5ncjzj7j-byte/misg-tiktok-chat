@@ -14,8 +14,8 @@ const MAX_SEEN_IDS = 50;
 
 const comments = [];
 const events = [];
-const seenEventIds = new Set();
 const seenCommentIds = new Set();
+const seenEventIds = new Set();
 
 let nextEventId = 0;
 let status = USERNAME ? "connecting" : "demo";
@@ -60,17 +60,39 @@ function addComment(user, message, id) {
 }
 
 function getUser(data) {
-  const user = data?.user || data?.author || {};
+  const user = data?.user || data?.author || data?.sender || {};
 
   return String(
     user.nickname ||
     user.displayName ||
+    user.display_name ||
     user.uniqueId ||
     user.unique_id ||
     data?.nickname ||
     data?.uniqueId ||
+    data?.unique_id ||
     "Viewer"
   ).slice(0, 40);
+}
+
+function getChatMessage(data) {
+  const candidates = [
+    data?.comment,
+    data?.text,
+    data?.content,
+    data?.message,
+    data?.chatMessage?.content,
+    data?.chatMessage?.text,
+    data?.common?.describe
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return "";
 }
 
 function addEvent(type, username, message, details = {}, externalId) {
@@ -114,9 +136,7 @@ function getViewerCount(data) {
 
     const count = Number(value);
 
-    if (Number.isSafeInteger(count) && count >= 0) {
-      return count;
-    }
+    if (Number.isSafeInteger(count) && count >= 0) return count;
   }
 
   return null;
@@ -205,12 +225,20 @@ if (!USERNAME) {
   connection.on(
     WebcastEvent.CHAT,
     safeHandleEvent("CHAT", (data) => {
+      console.log("[RAW CHAT EVENT]", JSON.stringify(data));
+
       const username = getUser(data);
-      const message = data?.comment ?? data?.text ?? "";
+      const message = getChatMessage(data);
+
+      if (!message) {
+        console.log("[CHAT SKIPPED] Could not find message text in payload.");
+        return;
+      }
 
       const messageId =
         data?.msgId ??
         data?.messageId ??
+        data?.common?.msgId ??
         `chat-${Date.now()}-${Math.random()}`;
 
       addComment(username, message, `chat-${messageId}`);
@@ -226,12 +254,11 @@ if (!USERNAME) {
 
       const username = getUser(data);
       const { giftName, quantity, coins } = getGiftDetails(data);
-      const message = `sent ${giftName} ×${quantity} (${coins} coins)`;
 
       addEvent(
         "gift",
         username,
-        message,
+        `sent ${giftName} ×${quantity} (${coins} coins)`,
         { giftName, quantity, coins },
         data?.msgId != null ? `gift-${data.msgId}` : undefined
       );
@@ -257,9 +284,7 @@ if (!USERNAME) {
       safeHandleEvent("LIKE", (data) => {
         const rawCount = Number(data?.likeCount ?? data?.count ?? 1);
         const count =
-          Number.isSafeInteger(rawCount) && rawCount > 0
-            ? rawCount
-            : 1;
+          Number.isSafeInteger(rawCount) && rawCount > 0 ? rawCount : 1;
 
         addEvent(
           "like",
@@ -332,10 +357,7 @@ const server = createServer((req, res) => {
   let url;
 
   try {
-    url = new URL(
-      req.url || "/",
-      `http://${req.headers.host || "localhost"}`
-    );
+    url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   } catch {
     res.writeHead(400);
     return res.end(JSON.stringify({ error: "Invalid URL" }));
@@ -346,9 +368,7 @@ const server = createServer((req, res) => {
     return res.end(JSON.stringify({ error: "Method not allowed" }));
   }
 
-  const path = url.pathname;
-
-  if (path === "/") {
+  if (url.pathname === "/") {
     return res.end(JSON.stringify({
       ok: true,
       service: "misg TikTok LIVE bridge",
@@ -357,15 +377,15 @@ const server = createServer((req, res) => {
     }));
   }
 
-  if (path === "/health") {
+  if (url.pathname === "/health") {
     return res.end(JSON.stringify({ ok: true, status }));
   }
 
-  if (path === "/comments") {
+  if (url.pathname === "/comments") {
     return res.end(JSON.stringify({ status, comments }));
   }
 
-  if (path === "/viewers") {
+  if (url.pathname === "/viewers") {
     return res.end(JSON.stringify({
       status,
       isLive: status === "connected",
@@ -375,12 +395,10 @@ const server = createServer((req, res) => {
     }));
   }
 
-  if (path === "/events") {
+  if (url.pathname === "/events") {
     const rawAfter = Number(url.searchParams.get("after") || 0);
     const after =
-      Number.isSafeInteger(rawAfter) && rawAfter > 0
-        ? rawAfter
-        : 0;
+      Number.isSafeInteger(rawAfter) && rawAfter > 0 ? rawAfter : 0;
 
     return res.end(JSON.stringify({
       status,
